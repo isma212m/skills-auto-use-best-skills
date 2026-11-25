@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "{{PY}} \"{{ROUTER}}\" hook sessionstart", "timeout": 5 }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "{{PY}} \"{{ROUTER}}\" hook prompt", "timeout": 5 }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "{{PY}} \"{{ROUTER}}\" hook precompact", "timeout": 5 }
+        ]
+      }
+    ]
+  }
+}
