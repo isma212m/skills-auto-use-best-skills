@@ -286,6 +286,7 @@ def concepts(prompt):
 
 def route(prompt, idx, cwd):
     prompt = prompt[:MAX_PROMPT]
+    prompt = re.sub(r"https?://\S+", " ", prompt)  # les mots d'une URL ne décrivent pas la demande
     entries = {e["name"]: e for e in idx["entries"].values()}  # doublons de nom fusionnés
     if not entries:
         return [], False

@@ -126,6 +126,10 @@ class T(unittest.TestCase):
         self.run_hook("sessionstart", source="startup")
         self.assertNotIn("use=", self.run_hook("prompt", prompt="the document is on the table over there"))
 
+    def test_url_words_are_ignored(self):
+        self.run_hook("sessionstart", source="startup")
+        self.assertNotIn("use=", self.run_hook("prompt", prompt="regarde https://example.com/merge/split/pdf/document.html"))
+
     def test_enabled_plugin_skills_only(self):
         for plug in ("alpha", "beta"):
             d = os.path.join(self.home, "cache", plug, "skills", plug + "-speed")
