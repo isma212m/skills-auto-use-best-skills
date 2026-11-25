@@ -6,6 +6,9 @@ Un routeur de skills **silencieux** pour Claude Code. Il choisit les bons skills
 - **Invocable** à la main : `/skills-auto-use-best-skills`.
 - **Python 3 standard uniquement.** Linux, macOS, Windows. Aucune dépendance.
 
+> ⚠️ **Tu as installé la v0.1.0 ? Mets à jour.** Elle permettait à un dépôt piégé d'injecter du texte dans le contexte de Claude (voir [Sécurité](#sécurité)). Il n'y a **pas de mise à jour automatique**. Dans ton dossier cloné :
+> `git pull`, puis `./install.sh` (ou `.\install.ps1` sous Windows), puis ouvre une nouvelle session.
+
 ## Installation (une commande)
 
 ```bash
@@ -27,11 +30,11 @@ Ouvre ensuite une nouvelle session Claude Code.
 ```mermaid
 flowchart LR
   P[Prompt] --> H[Hook UserPromptSubmit]
-  H -->|lit| I[(skills-index.json<br/>frontmatter seulement)]
-  H -->|lit/écrit| S[(active-skills-state.json)]
+  H -->|lit| I[(index.json<br/>frontmatter seulement)]
+  H -->|lit/écrit| S[(state-*.json)]
   H --> R{Nouveau skill<br/>pertinent ?}
   R -- non --> Z[0 token ajouté]
-  R -- oui --> B[Micro-bloc 3-5 lignes<br/>use= load= sig=]
+  R -- oui --> B[Micro-bloc<br/>use= sig= do=]
   B --> C[Claude charge 1-2 skills<br/>le corps SKILL.md uniquement pour eux]
   G[graphify-out/ présent ?] -. union, jamais remplacement .-> B
 ```
@@ -41,9 +44,11 @@ flowchart LR
 | Niveau | Contenu | Coût en contexte |
 |---|---|---|
 | 1. Index en cache | `name`, `description` condensée, mots-clés. Jamais le corps des `SKILL.md`. Re-parse seulement si le `mtime` change. | 0 (reste sur disque) |
-| 2. Chargement sélectif | Corps complet des 1-2 skills retenus (3 avec `graphify`). Pas de rechargement d'un skill déjà présent dans le contexte. | 3-5 lignes quand quelque chose change, rien sinon |
+| 2. Chargement sélectif | Corps complet des 1-2 skills retenus (3 avec `graphify`). Pas de rechargement d'un skill déjà présent dans le contexte. | Un micro-bloc quand un skill doit être chargé, rien sinon |
 
-Les hooks n'écrivent rien quand rien ne change. Au démarrage d'une session, un seul bloc rappelle les skills actifs et la liste des noms disponibles.
+Les hooks n'ajoutent rien au contexte quand rien ne change. Au démarrage d'une session, un seul bloc rappelle les skills actifs. La liste complète des skills n'est jamais injectée.
+
+Sources indexées : `~/.claude/skills/` et les skills des plugins activés (marketplace et plugins synchronisés).
 
 ### Persistance : redémarrage, `--resume`, compaction
 
@@ -51,7 +56,7 @@ Les hooks n'écrivent rien quand rien ne change. Au démarrage d'une session, un
 sequenceDiagram
   participant CC as Claude Code
   participant R as skill_router.py
-  participant S as active-skills-state.json
+  participant S as state-*.json
   CC->>R: SessionStart (startup / resume / continue)
   R->>S: epoch +1, lit skills actifs + graphify
   R-->>CC: micro-bloc (réactive les skills)
@@ -86,11 +91,24 @@ Si `graphify-out/` existe, si tu écris `/graphify`, ou si ta demande parle d'ar
 | `/skills-auto-use-best-skills reset` | Remet l'état à zéro |
 | `lock <skill>` / `unlock <skill>` | Protège un pipeline multi-étapes en cours (utilisé par Claude) |
 
-Fichiers : `.claude/skills-index.json` et `.claude/active-skills-state.json` (dans le projet si `.claude/` existe, sinon dans `~/.claude/`).
+Fichiers : `~/.claude/skill-router/index.json` et `~/.claude/skill-router/state-<hash du dossier>.json`.
+
+## Sécurité
+
+Un hook écrit dans le contexte de Claude : c'est une surface d'**injection de prompt**.
+
+- Le routeur ne lit **aucun fichier du projet ouvert** (ni skills, ni index, ni état). Il vérifie seulement si le dossier `graphify-out/` existe. Un dépôt cloné ne peut donc rien injecter par le routeur.
+- La sortie ne contient que des **noms de skills validés** (lettres, chiffres, `_ . -`, un `:` pour les plugins) : pas de description, pas de chemin.
+- Les skills offensifs / sécurité installés dans `~/.claude/skills/` ne sont proposés que si la demande parle de sécurité ou cite leur nom.
+- Le texte de tes demandes n'est ni enregistré ni envoyé : aucun accès réseau.
+- Limite : les skills et plugins que **tu** installes sont considérés comme fiables. Lis un skill avant de l'installer.
+
+**Mise à jour depuis la v0.1.0 (important).** La v0.1.0 lisait l'index et l'état dans le dossier `.claude/` du projet : un dépôt piégé pouvait injecter du texte dans le contexte. Relance l'installateur. Les anciens fichiers `skills-index.json` et `active-skills-state.json` ne sont plus lus.
 
 ## Limites
 
-- Le routage est lexical (mots-clés issus des descriptions), pas sémantique : une bonne `description` dans chaque `SKILL.md` améliore le résultat.
+- Le routage est lexical (mots-clés issus des descriptions, petite table de traduction FR→EN), pas sémantique. Il préfère ne rien proposer plutôt que proposer un hors-sujet : il rate donc des skills utiles. Claude garde son propre choix de skills.
+- Les skills propres à un projet (`.claude/skills/`) ne sont pas routés, par sécurité. Claude Code les voit toujours.
 - Un nouveau skill est vu à la session suivante (l'index est resynchronisé à `SessionStart`) ; `skill_router.py sync` le force.
 - Le temps de calcul du script est de quelques millisecondes ; le démarrage de Python (surtout sous Windows) ajoute 50 à 300 ms par hook.
 - Les hooks injectent du contexte ; Claude décide ensuite de charger le skill. Le routeur n'a aucun moyen de l'y forcer.

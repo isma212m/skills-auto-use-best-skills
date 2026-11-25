@@ -10,8 +10,8 @@ Copilote invisible : un hook injecte un micro-bloc `clé=valeur` quand un skill 
 
 ## Quand un bloc `router epoch=…` apparaît dans le contexte
 
-1. Lis les clés : `use=` (skills à utiliser), `load=` (chemins des SKILL.md), `pinned=`, `graphify=`, `sig=`, `do=`.
-2. Charge chaque skill de `use=` avec l'outil Skill (ou lis seulement le `SKILL.md` indiqué). Ne lis **jamais** le corps d'un skill qui n'est pas dans `use=` : l'index ne contient volontairement que le frontmatter, c'est ce qui garde le coût en tokens quasi nul.
+1. Lis les clés : `use=` (skills proposés), `pinned=`, `graphify=`, `sig=`, `do=`. Le bloc ne contient que des noms de skills.
+2. Charge avec l'outil Skill les skills de `use=` qui sont pertinents pour la demande ; ignore une proposition hors sujet (le routage est lexical). Ne charge rien d'autre à cause du routeur : c'est ce qui garde le coût en tokens bas.
 3. Ne demande aucune confirmation et n'interromps jamais une tâche multi-étapes en cours (génération de plusieurs fichiers, tests, build, indexation). Termine le cycle, puis applique le nouveau skill.
 4. Si `sig=` est présent, commence ta réponse par cette ligne telle quelle, une seule fois (ex. `[skills: graphify + frontend-design]`). Sans `sig=`, n'affiche rien : un changement de skill est le seul moment où l'utilisateur voit le routeur.
 5. `graphify=on` : garde `graphify-out/` comme couche de contexte structurel **en plus** des skills métier. Les skills s'additionnent, aucun n'en remplace un autre. Plafond : 2 skills métier + graphify.
@@ -36,11 +36,11 @@ Exécute la commande correspondante via Bash et affiche la sortie telle quelle, 
 | Saisie | Commande script |
 |---|---|
 | (rien) | `diag` : skills indexés, actifs, état graphify, verrou, budget tokens estimé |
-| `pin <skill>` / `unpin <skill>` | épingle ou libère un skill pour tout le projet |
-| `reset` | remet `active-skills-state.json` à zéro proprement |
+| `pin <skill>` / `unpin <skill>` | épingle ou libère un skill pour le dossier courant |
+| `reset` | remet l'état du dossier courant à zéro |
 | `sync` | force la mise à jour de l'index (normalement automatique) |
 
-Chemin du script : `~/.claude/skills/skills-auto-use-best-skills/scripts/skill_router.py` (ou `.claude/skills/...` si installé au niveau projet).
+Chemin du script : `~/.claude/skills/skills-auto-use-best-skills/scripts/skill_router.py`.
 
 ## Garde-fous
 

@@ -1,6 +1,6 @@
 <!-- skills-auto-use-best-skills:start -->
 # Routeur de skills (toujours actif)
-- Un bloc `router epoch=…` injecté par hook liste les skills à utiliser : charge-les via l'outil Skill, en silence.
+- Un bloc `router epoch=…` injecté par hook propose des skills : charge via l'outil Skill ceux qui sont pertinents, ignore les autres.
 - Pas de confirmation, pas d'interruption d'une tâche en cours ; ne relis pas un skill déjà chargé.
 - Si `sig=[skills: …]` est présent, affiche cette ligne une fois en début de réponse.
 - Avec `graphify=on`, garde graphify en couche de contexte en plus des skills métier.

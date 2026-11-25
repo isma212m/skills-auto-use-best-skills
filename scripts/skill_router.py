@@ -8,6 +8,7 @@ Bibliothèque standard uniquement. Deux usages :
 Principe : on n'indexe QUE le frontmatter des SKILL.md (jamais le corps), on ne met dans le
 contexte qu'un micro-bloc clé=valeur, et seulement quand quelque chose change (delta).
 """
+import hashlib
 import json
 import math
 import os
@@ -20,11 +21,29 @@ STICKY_SECS = 600          # un skill choisi reste "en cours" 10 min
 PRUNE_SECS = 86400         # les skills auto inactifs sont oubliés après 24 h
 MAX_AUTO = 2               # skills métier max par tour (3 avec graphify)
 MIN_SCORE = 3.0
-IDX_NAMES_CAP = 40
+MAX_PROMPT = 4000
+# Seul format de nom accepté dans le contexte : pas d'espace ni de saut de ligne.
+SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}(:[A-Za-z0-9][A-Za-z0-9_.-]{0,63})?")
+SECURITY_SKILL_RE = re.compile(r"^(exploiting|bypassing|detecting|conducting|testing|integrating|performing(?!-optimi)|implementing-(secret|semgrep|api-rate|cloud-waf|web-application)|configuring-tls)(-|$)")
+SECURITY_PROMPT_RE = re.compile(r"s[ée]curi|faille|vuln[ée]rab|pentest|hack|pirat|attaque|attack|exploit|\b(xss|csrf|ssrf|xxe|sqli?|injection|jwt|cors|waf|tls|idor|ctf|owasp|secrets?|rate.?limit\w*)\b", re.I)
+# mot de la demande (souvent en français) -> mots présents dans les descriptions (souvent en anglais)
+ALIASES = {k: v.split() for k, v in {
+    "bug": "debugging debug", "erreur": "debugging error", "plante": "debugging crash",
+    "lent": "performance optimization", "rapidité": "performance", "optimise": "optimization performance",
+    "relis": "review", "relecture": "review", "revue": "review",
+    "excel": "xlsx spreadsheet excel", "tableur": "xlsx spreadsheet", "tableau": "spreadsheet",
+    "word": "docx word", "diapo": "pptx presentation slide", "présentation": "pptx presentation",
+    "graphique": "chart visualization", "animation": "animation motion spring",
+    "fluide": "fluid motion spring", "accessibilité": "accessibility wcag",
+    "formulaire": "form email", "connexion": "login authentication",
+    "faille": "vulnerability", "sécurité": "security", "en-têtes": "header",
+}.items()}
 STOP = set("""the and for with that this from into your you are not but can use using when what how why will have has
 one any all also than then them they their our out per via est les des une pour dans avec sur par que qui quoi
 pas plus mais ont sont aux ses mon ton son nos vos leur leurs ces cet cette fait faire peux veux comme
 skill skills claude code user users should must may need needs make makes build builds create creates
+site web page file files fichier fichiers script task tasks project projet new nouvelle nouvelles mon
+application app data work asks about before after only avec fais moi
 """.split())
 ARCH_RE = re.compile(r"architecture|dependenc|dépendanc|call graph|codebase|base de code|structure du projet|how does .* work|comment .* fonctionne", re.I)
 CONT_RE = re.compile(r"^\s*(ok|oui|yes|go|continue|continues|suite|vas-y|vas y|next|et ensuite|merci|d'accord|parfait)\b[\s\S]{0,40}$", re.I)
@@ -47,9 +66,8 @@ def project_claude(cwd):
     return p if os.path.isdir(p) else None
 
 
-def data_dir(cwd):
-    """Dossier des fichiers d'état/index : projet si .claude existe, sinon ~/.claude."""
-    return project_claude(cwd) or home_claude()
+def router_dir():
+    return os.path.join(home_claude(), "skill-router")
 
 
 # ---------- frontmatter ----------
@@ -105,72 +123,98 @@ def condense(desc, limit=200):
     return " ".join(sents[:2])[:limit]
 
 
-def build_entry(path, fm, mtime):
-    name = fm.get("name") or os.path.basename(os.path.dirname(path))
+def build_entry(path, fm, mtime, prefix=""):
+    name = prefix + (fm.get("name") or os.path.basename(os.path.dirname(path)))
     desc = fm.get("description", "")
     extra = fm.get("triggers", "") + " " + fm.get("keywords", "")
     freq = {}
     for t in tokens(desc) + tokens(extra) * 2 + tokens(name.replace("-", " ")) * 3:
         freq[t] = freq.get(t, 0) + 1
     kws = [k for k, _ in sorted(freq.items(), key=lambda kv: -kv[1])][:14]
-    return {"name": name, "path": path, "mtime": mtime, "desc": condense(desc), "kw": kws}
+    return {"name": name, "mtime": mtime, "desc": condense(desc), "kw": kws}
 
 
 # ---------- index ----------
-def skill_files(cwd):
-    roots = [os.path.join(home_claude(), "skills"), os.path.join(cwd, ".claude", "skills")]
-    for root in roots:
-        if not os.path.isdir(root):
-            continue
-        for dp, dn, fn in os.walk(root):
-            depth = dp[len(root):].count(os.sep)
-            if depth > 3:
-                dn[:] = []
-                continue
-            if "SKILL.md" in fn:
-                yield os.path.join(dp, "SKILL.md")
+# Sécurité : les skills du dossier de projet ne sont jamais indexés. Un dépôt cloné ne doit pas
+# pouvoir décider de ce qui est chargé sans confirmation (Claude Code les voit toujours nativement).
+def walk_skills(root, prefix=""):
+    if not os.path.isdir(root):
+        return
+    for dp, dn, fn in os.walk(root):  # os.walk ne suit pas les liens symboliques
+        if dp[len(root):].count(os.sep) >= 3:
+            dn[:] = []
+        if "SKILL.md" in fn:
+            pre = prefix
+            if not pre and os.path.relpath(dp, root).split(os.sep)[0] == "synced":
+                pre = "anthropic-skills:"
+            yield os.path.join(dp, "SKILL.md"), pre
 
 
-def sync_index(cwd):
-    ddir = data_dir(cwd)
-    ipath = os.path.join(ddir, "skills-index.json")
-    old = read_json(ipath, {"entries": {}})
+def plugin_roots():
+    """(préfixe, dossier skills) des plugins activés : marketplace locale et plugins synchronisés."""
+    base = os.path.join(home_claude(), "plugins")
+    enabled = read_json(os.path.join(home_claude(), "settings.json"), {}).get("enabledPlugins", {})
+    installed = read_json(os.path.join(base, "installed_plugins.json"), {}).get("plugins", {})
+    for key, installs in installed.items():
+        if enabled.get(key) and installs:
+            yield key.split("@")[0] + ":", os.path.join(installs[-1].get("installPath", ""), "skills")
+    synced = os.path.join(base, "synced")
+    for account in (os.listdir(synced) if os.path.isdir(synced) else []):
+        adir = os.path.join(synced, account)
+        for p in read_json(os.path.join(adir, "manifest.json"), {}).get("plugins", []):
+            gen = p.get("generation")
+            pdir = os.path.join(adir, os.path.basename(str(p.get("name", ""))) + ("~g%s" % gen if gen else ""))
+            meta = read_json(os.path.join(pdir, ".claude-plugin", "plugin.json"), {})
+            if meta.get("name"):
+                yield meta["name"] + ":", os.path.join(pdir, "skills")
+
+
+def skill_files():
+    yield from walk_skills(os.path.join(home_claude(), "skills"))
+    for prefix, root in plugin_roots():
+        yield from walk_skills(root, prefix)
+
+
+def index_path():
+    return os.path.join(router_dir(), "index.json")
+
+
+def sync_index():
+    old = read_json(index_path(), {}).get("entries", {})
     entries, changed = {}, False
-    for p in skill_files(cwd):
+    for p, prefix in skill_files():
         try:
             mt = os.path.getmtime(p)
         except OSError:
             continue
-        prev = old.get("entries", {}).get(p)
+        prev = old.get(p)
         if prev and prev.get("mtime") == mt:
             entries[p] = prev
             continue
         fm = parse_frontmatter(p)
         if not fm:
             continue
-        e = build_entry(p, fm, mt)
-        if e["name"] == SELF:
+        e = build_entry(p, fm, mt, prefix)
+        if e["name"] == SELF or not SAFE_NAME.fullmatch(e["name"]):
             continue
         entries[p] = e
         changed = True
-    if set(entries) != set(old.get("entries", {})):
-        changed = True
-    idx = {"version": 1, "entries": entries}
-    if changed:
-        write_json(ipath, idx)
+    idx = {"version": 2, "entries": entries}
+    if changed or set(entries) != set(old):
+        write_json(index_path(), idx)
     return idx
 
 
-def load_index(cwd):
+def load_index():
     """Lecture seule du cache (chemin rapide des prompts) ; resync complète si absent."""
-    idx = read_json(os.path.join(data_dir(cwd), "skills-index.json"), None)
-    return idx if isinstance(idx, dict) and "entries" in idx else sync_index(cwd)
+    idx = read_json(index_path(), {})
+    return idx if idx.get("version") == 2 else sync_index()
 
 
 # ---------- état ----------
 def read_json(path, default):
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             return json.load(f)
     except (OSError, ValueError):
         return default
@@ -185,8 +229,9 @@ def write_json(path, obj):
 
 
 def state_path(cwd):
-    p = project_claude(cwd)
-    return os.path.join(p, "active-skills-state.json") if p else os.path.join(home_claude(), "active-skills-state.json")
+    """État par projet, mais rangé dans le home : un dépôt ne peut pas le fournir."""
+    key = hashlib.sha256(os.path.normcase(os.path.realpath(cwd)).encode("utf-8", "replace")).hexdigest()[:16]
+    return os.path.join(router_dir(), "state-%s.json" % key)
 
 
 def fresh_state():
@@ -197,11 +242,10 @@ def fresh_state():
 
 def load_state(cwd):
     s = read_json(state_path(cwd), None)
-    if not isinstance(s, dict):
-        s = read_json(os.path.join(home_claude(), "active-skills-state.json"), None)
     base = fresh_state()
     if isinstance(s, dict):
         base.update(s)
+    base["active_skills"] = {n: a for n, a in base["active_skills"].items() if SAFE_NAME.fullmatch(n)}
     base["router_always_on"] = True
     return base
 
@@ -228,33 +272,61 @@ def graphify_on(cwd):
 
 
 # ---------- routage ----------
+def concepts(prompt):
+    """{mot de la demande : variantes} : un mot et ses traductions ne comptent qu'une fois."""
+    res = {}
+    for w in re.findall(r"[a-zà-ÿ0-9][a-zà-ÿ0-9_\-]{2,}", prompt.lower()):
+        base = w[:-1] if len(w) > 4 and w[-1] in "sx" else w
+        extra = ALIASES.get(w) or ALIASES.get(base) or []
+        variants = set(tokens(w)) | set(tokens(" ".join(extra)))
+        if variants:
+            res[base] = variants
+    return res
+
+
 def route(prompt, idx, cwd):
-    entries = list(idx["entries"].values())
+    prompt = prompt[:MAX_PROMPT]
+    entries = {e["name"]: e for e in idx["entries"].values()}  # doublons de nom fusionnés
     if not entries:
         return [], False
-    names = {e["name"]: e for e in entries}
-    qt = set(tokens(prompt))
     pl = prompt.lower()
-    df = {}
-    for e in entries:
-        for k in set(e["kw"]):
+    security = bool(SECURITY_PROMPT_RE.search(prompt))
+    parts = {n: set(tokens(n.split(":")[-1].replace("-", " "))) for n in entries}
+    df, ndf = {}, {}
+    for n, e in entries.items():
+        for k in set(e["kw"]) | parts[n]:
             df[k] = df.get(k, 0) + 1
-    n = len(entries)
+        for k in parts[n]:
+            ndf[k] = ndf.get(k, 0) + 1
+    qc = concepts(prompt)
+    total = len(entries)
     scored = []
-    for e in entries:
-        if e["name"] == "graphify":
+    for name, e in entries.items():
+        short = name.split(":")[-1].lower()
+        if short == "graphify":
             continue  # composé séparément
-        s = sum(math.log(1 + n / df[k]) for k in e["kw"] if k in qt)
-        if re.search(r"(?<![\w-])" + re.escape(e["name"].lower()) + r"(?![\w-])", pl):
-            s += 6
-        if s >= MIN_SCORE:
-            scored.append((s, e["name"]))
+        # un nom d'un seul mot ("review", "docs") est trop courant pour valoir une demande explicite
+        named = ("-" in short or "/" + short in pl) and bool(
+            re.search(r"(?<![\w-])" + re.escape(short) + r"(?![\w-])", pl))
+        if SECURITY_SKILL_RE.match(short) and ":" not in name and not security and not named:
+            continue
+        kw = set(e["kw"])
+        s, hits, rare = 0.0, 0, False
+        for variants in qc.values():
+            m = variants & (kw | parts[name])
+            if not m:
+                continue
+            hits += 1
+            s += max(math.log(1 + total / df[k]) * (2 if k in parts[name] else 1) for k in m)
+            # un seul mot suffit s'il désigne ce skill et lui seul dans les noms
+            rare = rare or any(k in parts[name] and ndf[k] == 1 and len(k) > 2 for k in m)
+        if named:
+            s += 20
+        if s >= MIN_SCORE and (named or hits >= 2 or rare):
+            scored.append((s, name))
     scored.sort(reverse=True)
-    picked = []
-    if scored:
-        top = scored[0][0]
-        picked = [nm for s, nm in scored[:MAX_AUTO] if s >= 0.6 * top]
-    g = "graphify" in names and (graphify_on(cwd) or "graphify" in pl or bool(ARCH_RE.search(prompt)))
+    picked = [nm for s, nm in scored[:MAX_AUTO] if s >= 0.75 * scored[0][0]]
+    g = "graphify" in entries and (graphify_on(cwd) or "graphify" in pl or bool(ARCH_RE.search(prompt)))
     return picked, bool(g)
 
 
@@ -292,25 +364,21 @@ def micro(lines):
     return "\n".join(l for l in lines if l)
 
 
-def block_for(st, names, idx, epoch_start):
-    names = [n for n in names]
+def block_for(st, names, epoch_start):
+    """Ne contient que des noms validés par SAFE_NAME : ni chemin, ni description, ni liste complète."""
     pins = [n for n, a in st["active_skills"].items() if a["status"] == "pinned"]
-    paths = {e["name"]: e["path"] for e in idx["entries"].values()}
     lines = ["router epoch=%d" % st["context_epoch"]]
     if names:
         lines.append("use=" + ",".join(names))
-        lines.append("load=" + ";".join(paths[n] for n in names if n in paths))
     if pins and epoch_start:
         lines.append("pinned=" + ",".join(pins))
     if st.get("graphify_active"):
-        lines.append("graphify=on (keep graphify-out/ as structural context; additive)")
-    if epoch_start:
-        nm = sorted(e["name"] for e in idx["entries"].values())[:IDX_NAMES_CAP]
-        lines.append("idx=" + ",".join(nm))
+        lines.append("graphify=on")
     sig = sig_of(names, st.get("graphify_active") and "graphify" in names)
     if sig and sig != st.get("last_sig"):
-        lines.append("sig=" + sig + " (print once at start of reply)")
-    lines.append("do=invoke listed skills via Skill tool silently; never ask confirmation; never interrupt a running task")
+        lines.append("sig=" + sig)
+    if names:
+        lines.append("do=load via Skill tool if relevant, no confirmation")
     return micro(lines)
 
 
@@ -333,7 +401,9 @@ def hook(kind):
         st["reinject_pending"] = True
         save_state(cwd, st)
         return
-    idx = sync_index(cwd) if kind == "sessionstart" else load_index(cwd)
+    idx = sync_index() if kind == "sessionstart" else load_index()
+    known = {e["name"] for e in idx["entries"].values()}
+    st["active_skills"] = {n: a for n, a in st["active_skills"].items() if n in known}
     st["graphify_active"] = graphify_on(cwd)
     prune(st, now)
     if kind == "sessionstart":
@@ -345,7 +415,7 @@ def hook(kind):
         gl = st["graphify_active"] and "graphify" in {e["name"] for e in idx["entries"].values()}
         if gl and "graphify" not in names:
             names.append("graphify")
-        blk = block_for(st, names, idx, True)
+        blk = block_for(st, names, True)
         st["last_sig"] = sig_of(names, gl)
         for n in names:
             if n in st["active_skills"]:
@@ -355,10 +425,10 @@ def hook(kind):
         _out(blk + "\n")
         return
     # UserPromptSubmit
-    prompt = data.get("prompt", "") or ""
+    prompt = str(data.get("prompt") or "")[:MAX_PROMPT]
     if prompt.lstrip().lower().startswith("/" + SELF):
         return  # anti-récursion
-    m = re.match(r"^\s*/([\w:-]+)", prompt)
+    m = re.match(r"^\s*/([\w:.-]+)", prompt)
     if m and any(e["name"] == m.group(1) for e in idx["entries"].values()):
         upsert(st, m.group(1), "in_progress", now)  # invocation explicite : rien à injecter
         st["active_skills"][m.group(1)]["loaded_epoch"] = st["context_epoch"]
@@ -381,7 +451,7 @@ def hook(kind):
         to_load = list(dict.fromkeys(active_names(st, now) + to_load))
     out = ""
     if to_load or st.get("reinject_pending"):
-        out = block_for(st, to_load, idx, bool(st.get("reinject_pending")))
+        out = block_for(st, to_load, bool(st.get("reinject_pending")))
         for n in to_load:
             st["active_skills"][n]["loaded_epoch"] = st["context_epoch"]
         shown = active_names(st, now)
@@ -395,12 +465,12 @@ def hook(kind):
 
 # ---------- commandes manuelles ----------
 def diag(cwd):
-    idx = sync_index(cwd)
+    idx = sync_index()
     st = load_state(cwd)
     now = time.time()
     prune(st, now)
     act = st["active_skills"]
-    idx_chars = os.path.getsize(os.path.join(data_dir(cwd), "skills-index.json")) if os.path.exists(os.path.join(data_dir(cwd), "skills-index.json")) else 0
+    idx_chars = os.path.getsize(index_path()) if os.path.exists(index_path()) else 0
     locked = [n for n, a in act.items() if a.get("locked")]
     _out("\n".join([
         "skills-auto-use-best-skills · diagnostic",
@@ -424,7 +494,7 @@ def cmd(argv):
     if c == "diag":
         return diag(cwd)
     if c == "sync":
-        idx = sync_index(cwd)
+        idx = sync_index()
         _out("indexed=%d\n" % len(idx["entries"]))
         return 0
     if c == "reset":
@@ -436,7 +506,7 @@ def cmd(argv):
         _out("state reset\n")
         return 0
     name = argv[1]
-    names = {e["name"] for e in sync_index(cwd)["entries"].values()}
+    names = {e["name"] for e in sync_index()["entries"].values()}
     if c in ("pin", "lock") and name not in names:
         _out("unknown skill: %s\n" % name)
         return 1
